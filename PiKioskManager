@@ -1,0 +1,512 @@
+#!/bin/bash
+# =============================================================
+# setup-kiosk.sh
+# Sets up a fullscreen URL-cycling kiosk on:
+#   Raspberry Pi 5 — OS Lite 64-bit (Debian Trixie)
+#
+# Tested and confirmed working. All fixes included:
+#   - Xwrapper.config  (non-root X permission)
+#   - 99-vc4.conf      (Pi 5 GPU driver fix)
+#   - user groups      (tty/video/input/render)
+#   - remote debug     (Chromium port 9222 for kiosk.py)
+#
+# Usage: sudo bash setup-kiosk.sh
+# =============================================================
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+print_info()    { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
+print_step()    { echo -e "\n${CYAN}==>${NC} $1"; }
+
+if [ "$EUID" -ne 0 ]; then
+    print_error "Run with sudo: sudo bash setup-kiosk.sh"
+    exit 1
+fi
+
+KIOSK_USER="${SUDO_USER:-pi}"
+KIOSK_HOME=$(eval echo "~${KIOSK_USER}")
+print_info "Kiosk will run as user: ${YELLOW}${KIOSK_USER}${NC} (home: ${KIOSK_HOME})"
+
+clear
+echo ""
+echo "========================================"
+echo "   Kiosk Setup — Pi 5 OS Lite Trixie"
+echo "========================================"
+echo -e "  ${YELLOW}Tip: Press Ctrl+C at any time to quit${NC}"
+echo "========================================"
+echo ""
+echo "  This script will install and configure:"
+echo "    - Chromium (kiosk mode, fullscreen)"
+echo "    - openbox + xserver (minimal display layer)"
+echo "    - URL cycling controller (kiosk.py)"
+echo "    - Web UI to manage URLs (Flask, port 5000)"
+echo "    - Auto-start on boot, no login needed"
+echo ""
+read -r -p "Press Enter to begin, or Ctrl+C to cancel: "
+echo ""
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1 — SYSTEM UPDATE
+# ═══════════════════════════════════════════════════════════════
+print_step "Step 1 of 6 — Updating system packages"
+apt update && apt upgrade -y
+print_info "System up to date."
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2 — INSTALL PACKAGES
+# ═══════════════════════════════════════════════════════════════
+print_step "Step 2 of 6 — Installing packages"
+
+apt install -y --no-install-recommends \
+    xserver-xorg \
+    xinit \
+    openbox \
+    x11-xserver-utils \
+    chromium \
+    unclutter \
+    python3-flask \
+    python3-full
+
+print_info "Packages installed."
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3 — SYSTEM CONFIGURATION FOR X11
+# ═══════════════════════════════════════════════════════════════
+print_step "Step 3 of 6 — Configuring system for X11 + autologin"
+
+# Console autologin — B2 = Console Autologin (no password on tty1)
+raspi-config nonint do_boot_behaviour B2
+print_info "Console autologin enabled."
+
+# Add user to groups X11 requires
+# tty   : open /dev/tty0 — without this startx fails immediately
+# video : GPU and framebuffer access
+# input : keyboard, mouse, touch
+# render: GPU render nodes (/dev/dri/renderD*)
+usermod -a -G tty,video,input,render "${KIOSK_USER}"
+print_info "Added ${KIOSK_USER} to tty, video, input, render groups."
+
+# Allow non-root users to start X on Debian Trixie
+# Without this: parse_vt_settings: Cannot open /dev/tty0 (Permission denied)
+mkdir -p /etc/X11
+echo "needs_root_rights=yes" > /etc/X11/Xwrapper.config
+print_info "Xwrapper.config written."
+
+# Pi 5 GPU driver — tell X to use modesetting on the vc4 device
+# Without this: Cannot run in framebuffer mode. Please specify busIDs
+mkdir -p /etc/X11/xorg.conf.d
+cat > /etc/X11/xorg.conf.d/99-vc4.conf << 'EOF'
+Section "OutputClass"
+    Identifier "vc4"
+    MatchDriver "vc4"
+    Driver "modesetting"
+    Option "PrimaryGPU" "true"
+EndSection
+EOF
+print_info "Pi 5 GPU config written (99-vc4.conf)."
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4 — DEPLOY KIOSK FILES
+# ═══════════════════════════════════════════════════════════════
+print_step "Step 4 of 6 — Deploying kiosk files to /opt/kiosk"
+
+mkdir -p /opt/kiosk/web
+
+# kiosk.json — only create if it doesn't exist
+if [ ! -f /opt/kiosk/kiosk.json ]; then
+    cat > /opt/kiosk/kiosk.json << 'EOF'
+{
+  "urls": [
+    {"url": "https://example.com", "duration": 30}
+  ]
+}
+EOF
+    print_info "Created default kiosk.json"
+else
+    print_warning "kiosk.json already exists — leaving it unchanged."
+fi
+
+# kiosk.py — controls Chromium via remote debugging port 9222
+cat > /opt/kiosk/kiosk.py << 'PYEOF'
+#!/usr/bin/env python3
+# =============================================================
+# kiosk.py — URL cycling controller
+# Controls Chromium via its remote debugging API (port 9222).
+# No xdotool — uses direct HTTP calls to Chromium's own API.
+# Chromium must be launched with --remote-debugging-port=9222
+# =============================================================
+
+import json, time, urllib.request, sys
+
+CONFIG  = "/opt/kiosk/kiosk.json"
+DEBUG   = "http://localhost:9222"
+DEFAULT = {"urls": [{"url": "https://example.com", "duration": 30}]}
+
+def load():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT
+
+def wait_for_chromium():
+    print("[kiosk] Waiting for Chromium debug port...")
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"{DEBUG}/json", timeout=3)
+            print("[kiosk] Chromium is ready.")
+            return True
+        except Exception:
+            time.sleep(2)
+    return False
+
+def navigate(url):
+    """
+    Open a new tab to the URL and close the previous tab.
+    Most reliable method in kiosk mode — no focus/keyboard tricks needed.
+    """
+    try:
+        with urllib.request.urlopen(f"{DEBUG}/json", timeout=5) as r:
+            tabs = json.loads(r.read())
+
+        old_tab = next((t for t in tabs if t.get("type") == "page"), None)
+        old_id  = old_tab["id"] if old_tab else None
+
+        req = urllib.request.Request(f"{DEBUG}/json/new?{url}", method="PUT")
+        urllib.request.urlopen(req, timeout=5)
+        time.sleep(0.5)
+
+        if old_id:
+            try:
+                urllib.request.urlopen(f"{DEBUG}/json/close/{old_id}", timeout=5)
+            except Exception:
+                pass
+
+        print(f"[kiosk] -> {url}")
+
+    except Exception as e:
+        print(f"[kiosk] navigate error: {e}", file=sys.stderr)
+
+def main():
+    if not wait_for_chromium():
+        print("[kiosk] Chromium debug port never opened. Giving up.", file=sys.stderr)
+        sys.exit(1)
+
+    time.sleep(2)
+    index = 0
+
+    while True:
+        cfg  = load()
+        urls = cfg.get("urls", [])
+
+        if not urls:
+            time.sleep(10)
+            continue
+
+        index = index % len(urls)
+        url   = urls[index].get("url", "about:blank")
+        dur   = max(5, int(urls[index].get("duration", 30)))
+
+        navigate(url)
+        time.sleep(dur)
+        index += 1
+
+if __name__ == "__main__":
+    main()
+PYEOF
+chmod +x /opt/kiosk/kiosk.py
+print_info "kiosk.py written."
+
+# app.py — Flask web UI backend
+cat > /opt/kiosk/app.py << 'PYEOF'
+#!/usr/bin/env python3
+from flask import Flask, jsonify, request, send_from_directory
+import json, os
+
+app    = Flask(__name__)
+CONFIG = "/opt/kiosk/kiosk.json"
+DEFAULT = {"urls": [{"url": "https://example.com", "duration": 30}]}
+
+def load():
+    if not os.path.exists(CONFIG):
+        return DEFAULT
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT
+
+def save(data):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(data, f, indent=2)
+
+@app.route("/")
+def index():
+    return send_from_directory("/opt/kiosk/web", "index.html")
+
+@app.route("/api/urls", methods=["GET"])
+def get_urls():
+    return jsonify(load().get("urls", []))
+
+@app.route("/api/urls", methods=["POST"])
+def post_urls():
+    data = request.get_json(force=True)
+    if not isinstance(data, list):
+        return jsonify({"error": "expected a JSON array"}), 400
+    cfg = load()
+    cfg["urls"] = data
+    save(cfg)
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+PYEOF
+chmod +x /opt/kiosk/app.py
+print_info "app.py written."
+
+# index.html — web UI
+cat > /opt/kiosk/web/index.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kiosk Manager</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f1f5f9; color: #1e293b; padding: 2rem 1rem; min-height: 100vh; }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.2rem; }
+  .sub { color: #64748b; font-size: 0.85rem; margin-bottom: 1.75rem; }
+  #list { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 1rem; }
+  .row { display: grid; grid-template-columns: 1fr 90px 34px 34px 34px; gap: 0.4rem; align-items: center; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.6rem 0.75rem; }
+  .row input[type="text"] { border: 1px solid #cbd5e1; border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.875rem; width: 100%; outline: none; }
+  .row input[type="text"]:focus { border-color: #6366f1; }
+  .dur { display: flex; align-items: center; gap: 4px; }
+  .dur input { border: 1px solid #cbd5e1; border-radius: 6px; padding: 0.35rem 0.4rem; font-size: 0.875rem; width: 56px; outline: none; }
+  .dur span { font-size: 0.75rem; color: #94a3b8; }
+  .btn { border: none; border-radius: 6px; cursor: pointer; font-size: 0.8rem; height: 30px; width: 30px; display: flex; align-items: center; justify-content: center; }
+  .btn-up, .btn-dn { background: #f1f5f9; color: #475569; }
+  .btn-up:hover, .btn-dn:hover { background: #e2e8f0; }
+  .btn-del { background: #fee2e2; color: #b91c1c; }
+  .btn-del:hover { background: #fecaca; }
+  .actions { display: flex; gap: 0.6rem; margin-top: 0.5rem; }
+  .btn-add { flex: 1; height: 38px; width: auto; background: #f1f5f9; color: #1e293b; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.875rem; font-weight: 500; cursor: pointer; }
+  .btn-add:hover { background: #e2e8f0; }
+  .btn-save { flex: 1; height: 38px; width: auto; background: #4f46e5; color: #fff; border: none; border-radius: 8px; font-size: 0.875rem; font-weight: 600; cursor: pointer; }
+  .btn-save:hover { background: #4338ca; }
+  .toast { margin-top: 1rem; padding: 0.6rem 1rem; border-radius: 8px; font-size: 0.85rem; display: none; }
+  .toast.ok  { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+  .toast.err { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+  .toast.show { display: block; }
+  .empty { text-align: center; color: #94a3b8; font-size: 0.875rem; padding: 2rem 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Kiosk Manager</h1>
+  <p class="sub">Add URLs and set how long each displays before the next one loads.</p>
+  <div id="list"></div>
+  <div class="actions">
+    <button class="btn-add" onclick="addRow()">+ Add URL</button>
+    <button class="btn-save" onclick="saveAll()">Save</button>
+  </div>
+  <div id="toast" class="toast"></div>
+</div>
+<script>
+let items = [];
+async function load() {
+  try { const r = await fetch("/api/urls"); items = await r.json(); }
+  catch(e) { items = []; }
+  render();
+}
+function esc(s) { return (s||"").replace(/&/g,"&amp;").replace(/"/g,"&quot;"); }
+function render() {
+  const list = document.getElementById("list");
+  if (!items.length) { list.innerHTML = '<p class="empty">No URLs yet — click "+ Add URL" to get started.</p>'; return; }
+  list.innerHTML = "";
+  items.forEach((item, i) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `
+      <input type="text" value="${esc(item.url)}" placeholder="https://example.com" oninput="items[${i}].url=this.value">
+      <div class="dur">
+        <input type="number" value="${item.duration}" min="5" max="3600" oninput="items[${i}].duration=+this.value">
+        <span>sec</span>
+      </div>
+      <button class="btn btn-up"  onclick="move(${i},-1)" ${i===0?"disabled":""}>↑</button>
+      <button class="btn btn-dn"  onclick="move(${i}, 1)" ${i===items.length-1?"disabled":""}>↓</button>
+      <button class="btn btn-del" onclick="del(${i})">✕</button>`;
+    list.appendChild(row);
+  });
+}
+function addRow() {
+  items.push({url:"",duration:30}); render();
+  document.querySelectorAll(".row input[type='text']").forEach((el,i,a)=>{ if(i===a.length-1) el.focus(); });
+}
+function del(i)    { items.splice(i,1); render(); }
+function move(i,d) { const j=i+d; if(j<0||j>=items.length) return; [items[i],items[j]]=[items[j],items[i]]; render(); }
+async function saveAll() {
+  const clean = items.filter(x=>x.url&&x.url.trim());
+  try {
+    const r = await fetch("/api/urls",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(clean)});
+    const d = await r.json();
+    if(d.ok){ items=clean; render(); toast("Saved! Changes take effect on the next cycle.","ok"); }
+    else toast("Save failed: "+(d.error||"unknown"),"err");
+  } catch(e) { toast("Save failed: "+e,"err"); }
+}
+function toast(msg,type) {
+  const el=document.getElementById("toast");
+  el.textContent=msg; el.className=`toast ${type} show`;
+  setTimeout(()=>el.classList.remove("show"),3500);
+}
+load();
+</script>
+</body>
+</html>
+HTMLEOF
+print_info "index.html written."
+
+chown -R "${KIOSK_USER}:${KIOSK_USER}" /opt/kiosk
+chmod 664 /opt/kiosk/kiosk.json
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5 — USER SESSION FILES
+# ═══════════════════════════════════════════════════════════════
+print_step "Step 5 of 6 — Configuring user session files"
+
+# .bash_profile — starts X on tty1 (physical screen) only, not SSH
+cat > "${KIOSK_HOME}/.bash_profile" << 'EOF'
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+
+if [[ -z $DISPLAY && $XDG_VTNR -eq 1 ]]; then
+    startx -- -nocursor
+fi
+EOF
+chown "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.bash_profile"
+print_info ".bash_profile written."
+
+# .xinitrc — startx runs this, which launches openbox
+cat > "${KIOSK_HOME}/.xinitrc" << 'EOF'
+exec openbox-session
+EOF
+chown "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.xinitrc"
+print_info ".xinitrc written."
+
+# openbox autostart — runs inside X as the kiosk user
+cat > /etc/xdg/openbox/autostart << 'EOF'
+# Disable screensaver, blanking, power management
+xset s off
+xset s noblank
+xset -dpms
+
+# Hide mouse cursor after 1 second idle
+unclutter -idle 1 -root &
+
+# Clear Chromium crash flag — prevents restore dialog on boot
+sed -i 's/"exited_cleanly":false/"exited_cleanly":true/' \
+    ~/.config/chromium/'Local State' 2>/dev/null || true
+sed -i 's/"exit_type":"[^"]*"/"exit_type":"Normal"/' \
+    ~/.config/chromium/Default/Preferences 2>/dev/null || true
+
+# Launch Chromium in kiosk mode
+# --remote-debugging-port=9222 is required — kiosk.py uses this
+# to navigate pages without any keyboard/mouse simulation
+chromium \
+    --kiosk \
+    --remote-debugging-port=9222 \
+    --noerrdialogs \
+    --disable-infobars \
+    --no-first-run \
+    --password-store=basic \
+    --disable-translate \
+    --disable-features=TranslateUI \
+    --disable-session-crashed-bubble \
+    --disable-restore-session-state \
+    about:blank &
+
+# Start the URL cycling controller
+python3 /opt/kiosk/kiosk.py &
+EOF
+print_info "openbox autostart written."
+
+update-alternatives --set x-session-manager /usr/bin/openbox-session
+print_info "openbox set as default x-session-manager."
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6 — FLASK WEB UI SYSTEMD SERVICE
+# ═══════════════════════════════════════════════════════════════
+print_step "Step 6 of 6 — Creating kiosk-ui systemd service"
+
+cat > /etc/systemd/system/kiosk-ui.service << EOF
+[Unit]
+Description=Kiosk Web UI (Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${KIOSK_USER}
+WorkingDirectory=/opt/kiosk
+ExecStart=/usr/bin/python3 /opt/kiosk/app.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable kiosk-ui.service
+print_info "kiosk-ui.service enabled."
+
+# ═══════════════════════════════════════════════════════════════
+# DONE
+# ═══════════════════════════════════════════════════════════════
+CURRENT_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+
+echo ""
+echo "========================================"
+echo -e "  ${GREEN}Kiosk setup complete!${NC}"
+echo "========================================"
+echo ""
+echo "  On reboot the Pi will:"
+echo "    1. Auto-login as ${KIOSK_USER}"
+echo "    2. Start X on the physical display"
+echo "    3. Open Chromium fullscreen"
+echo "    4. Cycle through your URLs automatically"
+echo ""
+echo "  Manage URLs from any browser on your network:"
+if [ -n "$CURRENT_IP" ]; then
+    echo -e "    ${GREEN}http://${CURRENT_IP}:5000${NC}"
+else
+    echo -e "    ${GREEN}http://<pi-ip>:5000${NC}"
+fi
+echo ""
+echo "  SSH still works — X only starts on the"
+echo "  physical screen, not over SSH."
+echo ""
+echo "  Useful commands:"
+echo -e "    ${CYAN}sudo systemctl status kiosk-ui${NC}"
+echo -e "    ${CYAN}sudo systemctl restart kiosk-ui${NC}"
+echo ""
+
+read -r -p "Reboot now to start the kiosk? (yes/no): " ANS
+if [[ "$ANS" =~ ^[Yy] ]]; then
+    print_info "Rebooting in 5 seconds... (Ctrl+C to cancel)"
+    sleep 5
+    reboot
+else
+    print_warning "Reboot skipped. Run 'sudo reboot' when ready."
+fi
